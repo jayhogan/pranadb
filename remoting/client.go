@@ -1,6 +1,7 @@
-package notifier
+package remoting
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -16,8 +17,9 @@ const (
 )
 
 type Client interface {
-	BroadcastOneway(notif Notification) error
-	BroadcastSync(notif Notification) error
+	SendRequest(message ClusterMessage, timeout time.Duration, serverAddresses ...string) (ClusterMessage, error)
+	BroadcastOneway(notif ClusterMessage) error
+	BroadcastSync(notif ClusterMessage) error
 	Start() error
 	Stop() error
 }
@@ -75,23 +77,87 @@ func (c *client) makeUnavailableWithLock(serverAddress string) {
 	c.makeUnavailable(serverAddress)
 }
 
+// FIXME - refactor the client
+// So that we always pass in server addresses to broadcast too
+// and we just cache connections in here
+
+// SendRequest attempts to send the request to one of the serverAddresses starting at the first one
+func (c *client) SendRequest(requestMessage ClusterMessage, timeout time.Duration, serverAddresses ...string) (ClusterMessage, error) {
+	nf := c.createRequest(requestMessage, true)
+	messageBytes, err := nf.serialize(nil)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+
+	var respChan chan *ClusterResponse
+	start := time.Now()
+	for {
+		respChan = make(chan *ClusterResponse, 1)
+		ri := &responseInfo{respChan: respChan, conns: make(map[*clientConnection]struct{})}
+		c.responseChannels.Store(nf.sequence, ri)
+		sent := c.doSendRequest(messageBytes, ri, serverAddresses...)
+		if sent {
+			break
+		}
+		c.responseChannels.Delete(nf.sequence)
+		if time.Now().Sub(start) >= timeout {
+			return nil, errors.New("failed to send cluster request - no servers available")
+		}
+		time.Sleep(1 * time.Second)
+		log.Info("retrying")
+	}
+
+	resp, ok := <-respChan
+	if !ok {
+		return nil, errors.Error("channel was closed")
+	}
+	if resp == nil {
+		return nil, errors.Error("connection was closed")
+	}
+	c.responseChannels.Delete(nf.sequence)
+	if !resp.ok {
+		// An error was signalled from the other end
+		return nil, errors.New(resp.errMsg)
+	}
+	return resp.responseMessage, nil
+}
+
+func (c *client) doSendRequest(messageBytes []byte, ri *responseInfo, serverAddresses ...string) bool {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	ri.addToConnCount(1)
+	for _, serverAddress := range serverAddresses {
+		if err := c.maybeConnectAndSendMessage(messageBytes, serverAddress, ri); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // BroadcastSync broadcasts a notification to all nodes and waits until all nodes have responded before returning
-func (c *client) BroadcastSync(notif Notification) error {
-	nf := c.createNotifcationMessage(notif, true)
-	respChan := make(chan bool, len(c.serverAddresses))
-	ri := &responseInfo{respChan: respChan, conns: make(map[*clientConnection]struct{})}
-	c.responseChannels.Store(nf.sequence, ri)
-	if err := c.broadcast(nf, ri); err != nil {
+func (c *client) BroadcastSync(notificationMessage ClusterMessage) error {
+
+	// TODO abstract out common code sharded with SendRequest
+
+	nf := c.createRequest(notificationMessage, true)
+	messageBytes, err := nf.serialize(nil)
+	if err != nil {
 		return errors.WithStack(err)
 	}
-	ok, k := <-respChan
-	if !k {
+	respChan := make(chan *ClusterResponse, len(c.serverAddresses))
+	ri := &responseInfo{respChan: respChan, conns: make(map[*clientConnection]struct{})}
+	c.responseChannels.Store(nf.sequence, ri)
+	if err := c.broadcast(messageBytes, ri); err != nil {
+		return errors.WithStack(err)
+	}
+	resp, ok := <-respChan
+	if !ok {
 		return errors.Error("channel was closed")
 	}
 	c.responseChannels.Delete(nf.sequence)
-	if !ok {
+	if !resp.ok {
 		// An error was signalled from the other end
-		return errors.Error("failure in processing notification")
+		return errors.New(resp.errMsg)
 	}
 	return nil
 }
@@ -100,14 +166,79 @@ func (c *client) BroadcastSync(notif Notification) error {
 // Please note that this is best effort: servers will receive notifications only if they are available.
 // Notifications are not persisted and their is no total ordering. Ordering is guaranteed per client instance
 // The notifications system is not designed for high volumes of traffic.
-func (c *client) BroadcastOneway(notif Notification) error {
-	nf := c.createNotifcationMessage(notif, false)
-	return c.broadcast(nf, nil)
+func (c *client) BroadcastOneway(notificationMessage ClusterMessage) error {
+	nf := c.createRequest(notificationMessage, false)
+	messageBytes, err := nf.serialize(nil)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	return c.broadcast(messageBytes, nil)
 }
 
-func (c *client) broadcast(nf *NotificationMessage, ri *responseInfo) error {
+func (c *client) broadcast(messageBytes []byte, ri *responseInfo) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
+
+	c.maybeMakeUnavailableAvailable()
+	c.incrementConnCount(ri)
+	for serverAddress := range c.availableServers {
+		if err := c.maybeConnectAndSendMessage(messageBytes, serverAddress, ri); err != nil {
+			// Try with the next one
+			continue
+		}
+	}
+	// Best effort, not an error if we can't send
+	return nil
+}
+
+func (c *client) maybeConnectAndSendMessage(messageBytes []byte, serverAddress string, ri *responseInfo) error {
+	clientConn, ok := c.connections[serverAddress]
+	if !ok {
+		var err error
+		addr, err := net.ResolveTCPAddr("tcp", serverAddress)
+		var nc *net.TCPConn
+		if err == nil {
+			nc, err = net.DialTCP("tcp", nil, addr)
+			if err == nil {
+				err = nc.SetNoDelay(true)
+			}
+		}
+		if err != nil {
+			log.Warnf("failed to connect to %s %v", serverAddress, err)
+			c.makeUnavailable(serverAddress)
+			maybeRemoveFromConnCount(ri)
+			return err
+		}
+		clientConn = &clientConnection{
+			client:        c,
+			serverAddress: serverAddress,
+			conn:          nc,
+		}
+		clientConn.start()
+		c.connections[serverAddress] = clientConn
+	}
+	if err := writeMessage(requestMessageType, messageBytes, clientConn.conn); err != nil {
+		clientConn.Stop()
+		c.makeUnavailable(serverAddress)
+		c.connectionClosed(clientConn)
+		maybeRemoveFromConnCount(ri)
+		return err
+	} else if ri != nil {
+		ri.addConn(clientConn)
+	}
+	return nil
+}
+
+func (c *client) incrementConnCount(ri *responseInfo) {
+	// We can't rely on the length of the conns map in the ResponseInfo to determine how many connections have been used for the request
+	// As responses can come back before we've finished adding all the connections
+	// So we add on count for each server _before_ we send the request and we subtract any request that weren't used
+	if ri != nil {
+		ri.addToConnCount(int32(len(c.availableServers)))
+	}
+}
+
+func (c *client) maybeMakeUnavailableAvailable() {
 	if len(c.unavailableServers) > 0 {
 		now := time.Now()
 		for serverAddress, failTime := range c.unavailableServers {
@@ -119,53 +250,6 @@ func (c *client) broadcast(nf *NotificationMessage, ri *responseInfo) error {
 			}
 		}
 	}
-	// We can't rely on the length of the conns map in the ResponseInfo to determine how many connections have been used for the request
-	// As responses can come back before we've finished adding all the connections
-	// So we add on count for each server _before_ we send the request and we subtract any request that weren't used
-	if ri != nil {
-		ri.addToConnCount(int32(len(c.availableServers)))
-	}
-	for serverAddress := range c.availableServers {
-		clientConn, ok := c.connections[serverAddress]
-		if !ok {
-			var err error
-			addr, err := net.ResolveTCPAddr("tcp", serverAddress)
-			var nc *net.TCPConn
-			if err == nil {
-				nc, err = net.DialTCP("tcp", nil, addr)
-				if err == nil {
-					err = nc.SetNoDelay(true)
-				}
-			}
-			if err != nil {
-				log.Warnf("failed to connect to %s %v", serverAddress, err)
-				c.makeUnavailable(serverAddress)
-				maybeRemoveFromConnCount(ri)
-				continue
-			}
-			clientConn = &clientConnection{
-				client:        c,
-				serverAddress: serverAddress,
-				conn:          nc,
-			}
-			clientConn.start()
-			c.connections[serverAddress] = clientConn
-		}
-		bytes, err := nf.serialize(nil)
-		if err != nil {
-			maybeRemoveFromConnCount(ri)
-			return errors.WithStack(err)
-		}
-		if err := writeMessage(notificationMessageType, bytes, clientConn.conn); err != nil {
-			clientConn.Stop()
-			c.makeUnavailable(serverAddress)
-			c.connectionClosed(clientConn)
-			maybeRemoveFromConnCount(ri)
-		} else if ri != nil {
-			ri.addConn(clientConn)
-		}
-	}
-	return nil
 }
 
 func maybeRemoveFromConnCount(ri *responseInfo) {
@@ -174,12 +258,12 @@ func maybeRemoveFromConnCount(ri *responseInfo) {
 	}
 }
 
-func (c *client) createNotifcationMessage(notif Notification, requiresResponse bool) *NotificationMessage {
+func (c *client) createRequest(requestMessage ClusterMessage, requiresResponse bool) *ClusterRequest {
 	seq := atomic.AddInt64(&c.msgSeq, 1)
-	return &NotificationMessage{
+	return &ClusterRequest{
 		requiresResponse: requiresResponse,
 		sequence:         seq,
-		notif:            notif,
+		requestMessage:   requestMessage,
 	}
 }
 
@@ -230,24 +314,24 @@ func (c *client) addAvailableServers() {
 	}
 }
 
-func serializeNotification(notification Notification) ([]byte, error) {
+func serializeClusterMessage(clusterMessage ClusterMessage) ([]byte, error) {
 	b := proto.NewBuffer(nil)
-	nt := TypeForNotification(notification)
-	if nt == NotificationTypeUnknown {
-		return nil, errors.Errorf("invalid notification type %d", nt)
+	nt := TypeForClusterMessage(clusterMessage)
+	if nt == ClusterMessageTypeUnknown {
+		return nil, errors.Errorf("invalid cluster message type %d", nt)
 	}
 	err := b.EncodeVarint(uint64(nt))
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	err = b.Marshal(notification)
+	err = b.Marshal(clusterMessage)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	return b.Bytes(), nil
 }
 
-func (c *client) responseReceived(conn *clientConnection, resp *NotificationResponse) {
+func (c *client) responseReceived(conn *clientConnection, resp *ClusterResponse) {
 	r, ok := c.responseChannels.Load(resp.sequence)
 	if !ok {
 		return
@@ -261,27 +345,31 @@ func (c *client) responseReceived(conn *clientConnection, resp *NotificationResp
 
 type responseInfo struct {
 	lock      sync.Mutex
-	respChan  chan bool
+	respChan  chan *ClusterResponse
 	conns     map[*clientConnection]struct{}
 	connCount int32
+	resp      *ClusterResponse
 }
 
-func (r *responseInfo) responseReceived(conn *clientConnection, resp *NotificationResponse) {
+func (r *responseInfo) responseReceived(conn *clientConnection, resp *ClusterResponse) {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 	delete(r.conns, conn)
 	if !resp.ok {
-		// The server received the notification but sent back an error response
+		// The server received the cluster message but sent back an error response
 		// We return an error from the client call
-		r.respChan <- false
+		r.respChan <- resp
 		return
 	}
+	r.resp = resp
 	r.addToConnCount(-1)
 }
 
 func (r *responseInfo) addToConnCount(val int32) {
+	// A response might already have been received but conn count > 0 because a failed connection hasn't had it's
+	// conn count subtracted yet - when it does we might need to trigger the response
 	if atomic.AddInt32(&r.connCount, val) == 0 {
-		r.respChan <- true
+		r.respChan <- r.resp
 	}
 }
 
@@ -295,6 +383,10 @@ func (r *responseInfo) connClosed(conn *clientConnection) {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 	if atomic.LoadInt32(&r.connCount) == 0 {
+		return
+	}
+	_, ok := r.conns[conn]
+	if !ok {
 		return
 	}
 	delete(r.conns, conn)
@@ -378,16 +470,19 @@ func (cc *clientConnection) heartbeatReceived() {
 	cc.lock.Unlock()
 }
 
-func (cc *clientConnection) handleMessage(msgType messageType, msg []byte) {
+func (cc *clientConnection) handleMessage(msgType messageType, msg []byte) error {
 	if msgType == heartbeatMessageType {
 		cc.heartbeatReceived()
-		return
+		return nil
 	}
-	if msgType == notificationResponseMessageType {
-		resp := &NotificationResponse{}
-		resp.deserialize(msg)
+	if msgType == responseMessageType {
+		resp := &ClusterResponse{}
+		if err := resp.deserialize(msg); err != nil {
+			log.Errorf("failed to deserialize %v", err)
+			return err
+		}
 		cc.client.responseReceived(cc, resp)
-		return
+		return nil
 	}
-	panic("unexpected message type")
+	panic(fmt.Sprintf("unexpected message type %d", msgType))
 }
