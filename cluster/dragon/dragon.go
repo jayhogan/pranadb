@@ -75,8 +75,8 @@ type Dragon struct {
 	requestClientMap             sync.Map
 	requestClientPool            []remoting.Client
 	requestClientPoolLock        sync.Mutex
-	nodeHostAvailableLock sync.RWMutex
-	nodeHostStarted       bool
+	nodeHostAvailableLock        sync.RWMutex
+	nodeHostStarted              bool
 }
 
 type snapshot struct {
