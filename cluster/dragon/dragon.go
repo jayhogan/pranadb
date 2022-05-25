@@ -75,7 +75,6 @@ type Dragon struct {
 	requestClientMap             sync.Map
 	requestClientPool            []remoting.Client
 	requestClientPoolLock        sync.Mutex
-
 	nodeHostAvailableLock sync.RWMutex
 	nodeHostStarted       bool
 }
@@ -193,15 +192,13 @@ func (d *Dragon) ExecuteRemotePullQuery(queryInfo *cluster.QueryExecutionInfo, r
 			return nil, errors.WithStack(err)
 		}
 
-		// This is a hack do it better
-
 		if bytes[0] == 0 {
 			if time.Now().Sub(start) > 10*time.Second {
 				msg := string(bytes[1:])
 				return nil, errors.Errorf("failed to execute remote query %s %v", queryInfo.Query, msg)
 			}
 			// Retry - the pull engine might not be fully started....
-			time.Sleep(1 * time.Second)
+			time.Sleep(500 * time.Millisecond)
 		} else {
 			break
 		}
@@ -238,7 +235,7 @@ func (d *Dragon) Start() error { // nolint:gocyclo
 		logger.GetLogger("grpc").SetLevel(logger.WARNING)
 	}
 
-	log.Infof("Starting dragon on node %d", d.cnf.NodeID)
+	log.Debugf("Starting dragon on node %d", d.cnf.NodeID)
 
 	if d.remoteQueryExecutionCallback == nil {
 		panic("remote query execution callback must be set before start")
@@ -262,7 +259,7 @@ func (d *Dragon) Start() error { // nolint:gocyclo
 	}
 	d.pebble = peb
 
-	log.Infof("Opened pebble on node %d", d.cnf.NodeID)
+	log.Debugf("Opened pebble on node %d", d.cnf.NodeID)
 
 	if err := d.checkConstantShards(d.cnf.NumShards); err != nil {
 		return err
@@ -274,54 +271,54 @@ func (d *Dragon) Start() error { // nolint:gocyclo
 		return err
 	}
 
-	log.Infof("Joining groups on node %d", d.cnf.NodeID)
+	log.Debugf("Joining groups on node %d", d.cnf.NodeID)
 
 	err = d.joinSequenceGroup()
 	if err != nil {
 		return errors.WithStack(err)
 	}
 
-	log.Infof("Joined sequence group on node %d", d.cnf.NodeID)
+	log.Debugf("Joined sequence group on node %d", d.cnf.NodeID)
 
 	err = d.joinLockGroup()
 	if err != nil {
 		return errors.WithStack(err)
 	}
 
-	log.Infof("Joined lock group on node %d", d.cnf.NodeID)
+	log.Debugf("Joined lock group on node %d", d.cnf.NodeID)
 
 	err = d.joinShardGroups()
 	if err != nil {
 		return errors.WithStack(err)
 	}
 
-	log.Infof("Joined shard groups on node %d", d.cnf.NodeID)
+	log.Debugf("Joined shard groups on node %d", d.cnf.NodeID)
 
-	log.Infof("Joined node started group on node %d", d.cnf.NodeID)
+	log.Debugf("Joined node started group on node %d", d.cnf.NodeID)
 
 	// Now we make sure all groups are ready by executing lookups against them.
 
-	log.Infof("Prana node %d waiting for cluster to start", d.cnf.NodeID)
+	log.Debugf("Prana node %d waiting for cluster to start", d.cnf.NodeID)
 
-	log.Infof("Prana node %d Checking all data shards are alive", d.cnf.NodeID)
+	log.Debugf("Prana node %d Checking all data shards are alive", d.cnf.NodeID)
 	req := []byte{shardStateMachineLookupPing}
 	for _, shardID := range d.allDataShards {
 		if err := d.ExecutePingLookup(shardID, req); err != nil {
 			return errors.WithStack(err)
 		}
 	}
-	log.Info("Checking lock shard is alive")
+	log.Debug("Checking lock shard is alive")
 	if err := d.ExecutePingLookup(locksClusterID, nil); err != nil {
 		return errors.WithStack(err)
 	}
-	log.Info("Checking sequence shard is alive")
+	log.Debug("Checking sequence shard is alive")
 	if err := d.ExecutePingLookup(tableSequenceClusterID, nil); err != nil {
 		return errors.WithStack(err)
 	}
 
 	d.started = true
 
-	log.Infof("Prana node %d cluster started", d.cnf.NodeID)
+	log.Debugf("Prana node %d cluster started", d.cnf.NodeID)
 
 	return nil
 }
@@ -362,7 +359,6 @@ func (d *Dragon) executeSyncReadWithRetry(shardID uint64, request []byte) ([]byt
 		ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
 		res, err := d.nh.SyncRead(ctx, shardID, request)
 		cancel()
-		//log.Info("executing ping lookup")
 		return res, errors.WithStack(err)
 	}, retryTimeout)
 	if err != nil {
@@ -402,7 +398,7 @@ func (d *Dragon) Stop() error {
 			}
 		}
 	}
-	log.Infof("Stopped Dragon node %d", d.cnf.NodeID)
+	log.Debugf("Stopped Dragon node %d", d.cnf.NodeID)
 	return errors.WithStack(err)
 }
 
@@ -875,7 +871,7 @@ func (d *Dragon) checkDeleteToDeleteData(queryExec common.SimpleQueryExec) error
 	var remoteBatches []*cluster.ToDeleteBatch
 	var currBatch *cluster.ToDeleteBatch
 
-	log.Infof("There are %d to_delete entries", len(kvPairs))
+	log.Debugf("There are %d to_delete entries", len(kvPairs))
 
 	for _, kvPair := range kvPairs {
 		offset := 16
@@ -910,7 +906,7 @@ func (d *Dragon) checkDeleteToDeleteData(queryExec common.SimpleQueryExec) error
 			}
 			if !exists {
 				for _, prefix := range batch.Prefixes {
-					log.Infof("Deleting all local data with prefix %s", common.DumpDataKey(prefix))
+					log.Debugf("Deleting all local data with prefix %s", common.DumpDataKey(prefix))
 					endPrefix := common.IncrementBytesBigEndian(prefix)
 					if err := d.deleteAllDataInRangeLocally(pBatch, prefix, endPrefix); err != nil {
 						return err
@@ -918,7 +914,7 @@ func (d *Dragon) checkDeleteToDeleteData(queryExec common.SimpleQueryExec) error
 				}
 			} else {
 				// Conditional key exists - this means we do not delete the data
-				log.Infof("Not deleting to_delete data as table with id %d exists", batch.ConditionalTableID)
+				log.Debugf("Not deleting to_delete data as table with id %d exists", batch.ConditionalTableID)
 			}
 		}
 		if err := d.pebble.Apply(pBatch, nosyncWriteOptions); err != nil {
@@ -934,9 +930,9 @@ func (d *Dragon) checkDeleteToDeleteData(queryExec common.SimpleQueryExec) error
 				return err
 			}
 			if !exists {
-				log.Infof("Conditional table with id %d does not exist, there are %d prefixes", batch.ConditionalTableID, len(batch.Prefixes))
+				log.Debugf("Conditional table with id %d does not exist, there are %d prefixes", batch.ConditionalTableID, len(batch.Prefixes))
 				for _, prefix := range batch.Prefixes {
-					log.Infof("Deleting all remote data with prefix %s", common.DumpDataKey(prefix))
+					log.Debugf("Deleting all remote data with prefix %s", common.DumpDataKey(prefix))
 					endPrefix := common.IncrementBytesBigEndian(prefix)
 					// shard id is first 8 bytes
 					shardID, _ := common.ReadUint64FromBufferBE(prefix, 0)
@@ -977,7 +973,7 @@ func (d *Dragon) tableExists(queryExec common.SimpleQueryExec, id uint64) (bool,
 // Currently the number of shards in the cluster is fixed. We must make sure the user doesn't change the number of shards
 // in the config after the cluster has been created. So we store the number in the database and check
 func (d *Dragon) checkConstantShards(expectedShards int) error {
-	log.Infof("Checking constant shards: %d", expectedShards)
+	log.Debugf("Checking constant shards: %d", expectedShards)
 	key := table.EncodeTableKeyPrefix(common.LocalConfigTableID, 0, 16)
 	propKey := []byte("num-shards")
 	key = common.AppendUint32ToBufferBE(key, uint32(len(propKey)))
@@ -999,7 +995,7 @@ func (d *Dragon) checkConstantShards(expectedShards int) error {
 		}
 	} else {
 		shards, _ := common.ReadUint32FromBufferBE(v, 0)
-		log.Infof("value for num-shards found in storage: %d", shards)
+		log.Debugf("value for num-shards found in storage: %d", shards)
 		if int(shards) != expectedShards {
 			return errors.Errorf("number of shards in cluster cannot be changed after cluster creation. cluster value %d new value %d", expectedShards, shards)
 		}
